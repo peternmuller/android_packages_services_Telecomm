@@ -233,6 +233,14 @@ public class CallsManager extends Call.ListenerBase
 
     private HashMap<String, Boolean> mLchStatus = new HashMap<String, Boolean>();
 
+    // Two global variables used to handle the Emergency Call when there
+    // is no room available for emergency call. Buffer the Emergency Call
+    // in mPendingMOEmerCall until the Current Active call is disconnected
+    // successfully and place the mPendingMOEmerCall followed by clearing
+    // buffer.
+    private Call mPendingMOEmerCall = null;
+    private Call mDisconnectingCall = null;
+
     /**
      * Initializes the required Telecom components.
      */
@@ -981,7 +989,10 @@ public class CallsManager extends Call.ListenerBase
         // Do not add the call if it is a potential MMI code.
         if ((isPotentialMMICode(handle) || isPotentialInCallMMICode) && !needsAccountSelection) {
             call.addListener(this);
-        } else if (!mCalls.contains(call)) {
+        // If call is Emergency type and marked it as Pending, call would not be added
+        // in mCalls here. It will be handled when the current active call (mDisconnectingCall)
+        // is disconnected successfully.
+        } else if (!mCalls.contains(call) && mPendingMOEmerCall == null) {
             // We check if mCalls already contains the call because we could potentially be reusing
             // a call which was previously added (See {@link #reuseOutgoingCall}).
             addCall(call);
@@ -1052,9 +1063,13 @@ public class CallsManager extends Call.ListenerBase
             if (!call.isEmergencyCall()) {
                 updateLchStatus(call.getTargetPhoneAccount().getId());
             }
+            //Block to initiate Emregency call now as the current active call
+            //is not yet disconnected.
+            if (mPendingMOEmerCall == null) {
             // If the account has been set, proceed to place the outgoing call.
             // Otherwise the connection will be initiated when the account is set by the user.
-            call.startCreateConnection(mPhoneAccountRegistrar);
+                call.startCreateConnection(mPhoneAccountRegistrar);
+            }
         } else if (mPhoneAccountRegistrar.getCallCapablePhoneAccounts(
                 requireCallCapableAccountByHandle ? call.getHandle().getScheme() : null, false,
                 call.getInitiatingUser()).isEmpty()) {
@@ -1548,6 +1563,14 @@ public class CallsManager extends Call.ListenerBase
                 mLchStatus.put(subId, false);
                 manageDsdaInCallTones(false);
             }
+        }
+        // Emergency MO call is still pending and current active call is
+        // disconnected succesfully. So initiating pending Emergency call
+        // now and clearing both pending and Disconnectcalls.
+        if (mPendingMOEmerCall != null && mDisconnectingCall == call) {
+            addCall(mPendingMOEmerCall);
+            mPendingMOEmerCall.startCreateConnection(mPhoneAccountRegistrar);
+            clearPendingMOEmergencyCall();
         }
     }
 
@@ -2095,10 +2118,33 @@ public class CallsManager extends Call.ListenerBase
         return MAXIMUM_DIALING_CALLS <= getNumCallsWithState(CallState.DIALING);
     }
 
+    /**
+     * Returns true if there is an Emergency Call in Call list.
+     */
+    private boolean IsEmergencyCallInProgress() {
+        for (Call call : mCalls) {
+            if (call.isEmergencyCall()) {
+                // We never support add call if one of the calls is an emergency call.
+                return true;
+            }
+        }
+        return false;
+    }
+
     private boolean makeRoomForOutgoingCall(Call call, boolean isEmergency) {
+        if (isEmergency && IsEmergencyCallInProgress()) {
+            Log.i(this, "emergency call is progress so no room for new E Call");
+            return false;
+        }
         if (TelephonyManager.getDefault().getMultiSimConfiguration()
                 == TelephonyManager.MultiSimVariants.DSDA) {
             return makeRoomForOutgoingCallForDsda(call, isEmergency);
+        }
+        // Reject If there is any Incoming Call while initiating an
+        // an Emergency Call.
+        if (isEmergency && hasMaximumRingingCalls()) {
+            Call rinigingCall = getRingingCall();
+            rinigingCall.reject(false, null);
         }
         if (hasMaximumLiveCalls()) {
             // NOTE: If the amount of live calls changes beyond 1, this logic will probably
@@ -2123,6 +2169,12 @@ public class CallsManager extends Call.ListenerBase
                     call.getAnalytics().setCallIsAdditional(true);
                     outgoingCall.getAnalytics().setCallIsInterrupted(true);
                     outgoingCall.disconnect();
+                    // buffer this call in to mPendingMOEmerCall and do not initiate this call
+                    // until the current outgoing call mDisconnectingCall is disconnected
+                    // successfully. Emergency Call would be initiated upon receiving the
+                    // Disconnection response from lower layers.
+                    mDisconnectingCall = outgoingCall;
+                    mPendingMOEmerCall = call;
                     return true;
                 }
                 if (outgoingCall.getState() == CallState.SELECT_PHONE_ACCOUNT) {
@@ -2144,6 +2196,12 @@ public class CallsManager extends Call.ListenerBase
                     call.getAnalytics().setCallIsAdditional(true);
                     liveCall.getAnalytics().setCallIsInterrupted(true);
                     liveCall.disconnect();
+                    // buffer this call in to mPendingMOEmerCall and do not initiate this call
+                    // until the current live call "mDisconnectingCall" is disconnected
+                    // successfully. Emergency Call would be initiated upon receiving the
+                    // Disconnection response from lower layers.
+                    mDisconnectingCall = liveCall;
+                    mPendingMOEmerCall = call;
                     return true;
                 }
                 return false;  // No more room!
@@ -2755,5 +2813,10 @@ public class CallsManager extends Call.ListenerBase
         } catch (NumberFormatException ex) {
             Log.d(this, "setLocalCallHold" + ex);
         }
+    }
+
+    public void clearPendingMOEmergencyCall() {
+        mPendingMOEmerCall = null;
+        mDisconnectingCall = null;
     }
 }
