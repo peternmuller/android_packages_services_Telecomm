@@ -382,8 +382,8 @@ public class CallAudioManager extends CallsManagerListenerBase {
         return null;
     }
 
-    public boolean hasAnyCalls() {
-        return mCallsManager.hasAnyCalls();
+    public boolean hasAnyAliveCalls() {
+        return !mCallsManager.hasOnlyDisconnectedCalls();
     }
 
     void toggleMute() {
