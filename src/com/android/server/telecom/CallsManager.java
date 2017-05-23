@@ -17,7 +17,6 @@
 package com.android.server.telecom;
 
 import android.app.ActivityManager;
-import android.app.NotificationManager;
 import android.content.Context;
 import android.content.pm.UserInfo;
 import android.content.Intent;
@@ -66,6 +65,7 @@ import com.android.server.telecom.callfiltering.CallScreeningServiceFilter;
 import com.android.server.telecom.callfiltering.DirectToVoicemailCallFilter;
 import com.android.server.telecom.callfiltering.IncomingCallFilter;
 import com.android.server.telecom.components.ErrorDialogActivity;
+import com.android.server.telecom.ui.ConfirmCallDialogActivity;
 import com.android.server.telecom.ui.IncomingCallNotifier;
 
 import java.util.ArrayList;
@@ -122,6 +122,30 @@ public class CallsManager extends Call.ListenerBase
 
     private static final String TAG = "CallsManager";
 
+    private static final String PERMISSION_PROCESS_PHONE_ACCOUNT_REGISTRATION =
+            "android.permission.PROCESS_PHONE_ACCOUNT_REGISTRATION";
+
+    /**
+     * Call filter specifier used with
+     * {@link #getNumCallsWithState(int, Call, PhoneAccountHandle, int...)} to indicate only
+     * self-managed calls should be included.
+     */
+    private static final int CALL_FILTER_SELF_MANAGED = 1;
+
+    /**
+     * Call filter specifier used with
+     * {@link #getNumCallsWithState(int, Call, PhoneAccountHandle, int...)} to indicate only
+     * managed calls should be included.
+     */
+    private static final int CALL_FILTER_MANAGED = 2;
+
+    /**
+     * Call filter specifier used with
+     * {@link #getNumCallsWithState(int, Call, PhoneAccountHandle, int...)} to indicate both managed
+     * and self-managed calls should be included.
+     */
+    private static final int CALL_FILTER_ALL = 3;
+
     private static final int HANDLER_WAIT_TIMEOUT = 10000;
     private static final int MAXIMUM_LIVE_CALLS = 1;
     private static final int MAXIMUM_HOLD_CALLS = 1;
@@ -135,9 +159,24 @@ public class CallsManager extends Call.ListenerBase
             {CallState.CONNECTING, CallState.SELECT_PHONE_ACCOUNT, CallState.DIALING,
                     CallState.PULLING};
 
+    /**
+     * These states are used by {@link #makeRoomForOutgoingCall(Call, boolean)} to determine which
+     * call should be ended first to make room for a new outgoing call.
+     */
     private static final int[] LIVE_CALL_STATES =
             {CallState.CONNECTING, CallState.SELECT_PHONE_ACCOUNT, CallState.DIALING,
                     CallState.PULLING, CallState.ACTIVE};
+
+    /**
+     * These states determine which calls will cause {@link TelecomManager#isInCall()} or
+     * {@link TelecomManager#isInManagedCall()} to return true.
+     *
+     * See also {@link PhoneStateBroadcaster}, which considers a similar set of states as being
+     * off-hook.
+     */
+    public static final int[] ONGOING_CALL_STATES =
+            {CallState.SELECT_PHONE_ACCOUNT, CallState.DIALING, CallState.PULLING, CallState.ACTIVE,
+                    CallState.ON_HOLD, CallState.RINGING};
 
     private static final int[] ANY_CALL_STATE =
             {CallState.NEW, CallState.CONNECTING, CallState.SELECT_PHONE_ACCOUNT, CallState.DIALING,
@@ -168,6 +207,12 @@ public class CallsManager extends Call.ListenerBase
      */
     private final Set<Call> mCalls = Collections.newSetFromMap(
             new ConcurrentHashMap<Call, Boolean>(8, 0.9f, 1));
+
+    /**
+     * A pending call is one which requires user-intervention in order to be placed.
+     * Used by {@link #startCallConfirmation(Call)}.
+     */
+    private Call mPendingCall;
 
     /**
      * The current telecom call ID.  Used when creating new instances of {@link Call}.  Should
@@ -212,7 +257,6 @@ public class CallsManager extends Call.ListenerBase
     private final DefaultDialerCache mDefaultDialerCache;
     private final Timeouts.Adapter mTimeoutsAdapter;
     private final PhoneNumberUtilsAdapter mPhoneNumberUtilsAdapter;
-    private final NotificationManager mNotificationManager;
     private final Set<Call> mLocallyDisconnectingCalls = new HashSet<>();
     private final Set<Call> mPendingCallsToDisconnect = new HashSet<>();
     /* Handler tied to thread in which CallManager was initialized. */
@@ -232,6 +276,21 @@ public class CallsManager extends Call.ListenerBase
     // buffer.
     private Call mPendingMOEmerCall = null;
     private Call mDisconnectingCall = null;
+
+    /**
+     * Listener to PhoneAccountRegistrar events.
+     */
+    private PhoneAccountRegistrar.Listener mPhoneAccountListener =
+            new PhoneAccountRegistrar.Listener() {
+        public void onPhoneAccountRegistered(PhoneAccountRegistrar registrar,
+                                             PhoneAccountHandle handle) {
+            broadcastRegisterIntent(handle);
+        }
+        public void onPhoneAccountUnRegistered(PhoneAccountRegistrar registrar,
+                                               PhoneAccountHandle handle) {
+            broadcastUnregisterIntent(handle);
+        }
+    };
 
     /**
      * Initializes the required Telecom components.
@@ -254,7 +313,6 @@ public class CallsManager extends Call.ListenerBase
             Timeouts.Adapter timeoutsAdapter,
             AsyncRingtonePlayer asyncRingtonePlayer,
             PhoneNumberUtilsAdapter phoneNumberUtilsAdapter,
-            InterruptionFilterProxy interruptionFilterProxy,
             EmergencyCallHelper emergencyCallHelper) {
         mContext = context;
         mLock = lock;
@@ -262,6 +320,7 @@ public class CallsManager extends Call.ListenerBase
         mContactsAsyncHelper = contactsAsyncHelper;
         mCallerInfoAsyncQueryFactory = callerInfoAsyncQueryFactory;
         mPhoneAccountRegistrar = phoneAccountRegistrar;
+        mPhoneAccountRegistrar.addListener(mPhoneAccountListener);
         mMissedCallNotifier = missedCallNotifier;
         StatusBarNotifier statusBarNotifier = new StatusBarNotifier(context, this);
         mWiredHeadsetManager = wiredHeadsetManager;
@@ -275,8 +334,6 @@ public class CallsManager extends Call.ListenerBase
 
         mDtmfLocalTonePlayer =
                 new DtmfLocalTonePlayer(new DtmfLocalTonePlayer.ToneGeneratorProxy());
-        mNotificationManager = (NotificationManager) context.getSystemService(
-                Context.NOTIFICATION_SERVICE);
         CallAudioRouteStateMachine callAudioRouteStateMachine = new CallAudioRouteStateMachine(
                 context,
                 this,
@@ -284,7 +341,6 @@ public class CallsManager extends Call.ListenerBase
                 wiredHeadsetManager,
                 statusBarNotifier,
                 audioServiceFactory,
-                interruptionFilterProxy,
                 CallAudioRouteStateMachine.doesDeviceSupportEarpieceRoute()
         );
         callAudioRouteStateMachine.initialize();
@@ -902,15 +958,15 @@ public class CallsManager extends Call.ListenerBase
      * For managed connections, this is the first step to launching the Incall UI.
      * For self-managed connections, we don't expect the Incall UI to launch, but this is still a
      * first step in getting the self-managed ConnectionService to create the connection.
-     *
      * @param handle Handle to connect the call with.
      * @param phoneAccountHandle The phone account which contains the component name of the
      *        connection service to use for this call.
      * @param extras The optional extras Bundle passed with the intent used for the incoming call.
      * @param initiatingUser {@link UserHandle} of user that place the outgoing call.
+     * @param originalIntent
      */
     Call startOutgoingCall(Uri handle, PhoneAccountHandle phoneAccountHandle, Bundle extras,
-            UserHandle initiatingUser) {
+            UserHandle initiatingUser, Intent originalIntent) {
         boolean isReusedCall = true;
         Call call = reuseOutgoingCall(handle);
 
@@ -950,7 +1006,6 @@ public class CallsManager extends Call.ListenerBase
             }
 
             call.setInitiatingUser(initiatingUser);
-
             isReusedCall = false;
         }
 
@@ -1068,14 +1123,20 @@ public class CallsManager extends Call.ListenerBase
         }
         setIntentExtrasAndStartTime(call, extras);
 
-        // Do not add the call if it is a potential MMI code.
-        if ((isPotentialMMICode(handle) || isPotentialInCallMMICode) && !needsAccountSelection) {
+        if ((isPotentialMMICode(handle) || isPotentialInCallMMICode)
+                && !needsAccountSelection) {
+            // Do not add the call if it is a potential MMI code.
             call.addListener(this);
-        // If call is Emergency type and marked it as Pending, call would not be added
-        // in mCalls here. It will be handled when the current active call (mDisconnectingCall)
-        // is disconnected successfully.
-        } else if (!mCalls.contains(call) && mPendingMOEmerCall == null) {
-            // We check if mCalls already contains the call because we could potentially be reusing
+        } else if (!isSelfManaged && hasSelfManagedCalls() && !call.isEmergencyCall()) {
+            // Adding a managed call and there are ongoing self-managed call(s).
+            call.setOriginalCallIntent(originalIntent);
+            startCallConfirmation(call);
+            return null;
+            // If call is Emergency type and marked it as Pending, call would not be added
+            // in mCalls here. It will be handled when the current active call (mDisconnectingCall)
+            // is disconnected successfully.
+         } else if (!mCalls.contains(call) && mPendingMOEmerCall == null) {
+             // We check if mCalls already contains the call because we could potentially be reusing
             // a call which was previously added (See {@link #reuseOutgoingCall}).
             addCall(call);
         }
@@ -1146,23 +1207,11 @@ public class CallsManager extends Call.ListenerBase
             if (call.isSelfManaged() && !isOutgoingCallPermitted) {
                 notifyCreateConnectionFailed(call.getTargetPhoneAccount(), call);
             } else if (!call.isSelfManaged() && hasSelfManagedCalls() && !call.isEmergencyCall()) {
-                Call activeCall = getActiveCall();
-                CharSequence errorMessage;
-                if (activeCall == null) {
-                    // Realistically this shouldn't happen, but best to handle gracefully
-                    errorMessage = mContext.getText(R.string.cant_call_due_to_ongoing_unknown_call);
-                } else {
-                    errorMessage = mContext.getString(R.string.cant_call_due_to_ongoing_call,
-                            activeCall.getTargetPhoneAccountLabel());
-                }
-                // Call is managed and there are ongoing self-managed calls.
-                markCallAsDisconnected(call, new DisconnectCause(DisconnectCause.ERROR,
-                        errorMessage, errorMessage, "Ongoing call in another app."));
-                markCallAsRemoved(call);
+                markCallDisconnectedDueToSelfManagedCall(call);
             } else {
                 if (call.isEmergencyCall()) {
                     // Disconnect all self-managed calls to make priority for emergency call.
-                    mCalls.stream().filter(c -> c.isSelfManaged()).forEach(c -> c.disconnect());
+                    disconnectSelfManagedCalls();
                 }
 
                 if (mPendingMOEmerCall == null) {
@@ -1672,6 +1721,33 @@ public class CallsManager extends Call.ListenerBase
     }
 
     /**
+     * Given a call, marks the call as disconnected and removes it.  Set the error message to
+     * indicate to the user that the call cannot me placed due to an ongoing call in another app.
+     *
+     * Used when there are ongoing self-managed calls and the user tries to make an outgoing managed
+     * call.  Called by {@link #startCallConfirmation(Call)} when the user is already confirming an
+     * outgoing call.  Realistically this should almost never be called since in practice the user
+     * won't make multiple outgoing calls at the same time.
+     *
+     * @param call The call to mark as disconnected.
+     */
+    void markCallDisconnectedDueToSelfManagedCall(Call call) {
+        Call activeCall = getActiveCall();
+        CharSequence errorMessage;
+        if (activeCall == null) {
+            // Realistically this shouldn't happen, but best to handle gracefully
+            errorMessage = mContext.getText(R.string.cant_call_due_to_ongoing_unknown_call);
+        } else {
+            errorMessage = mContext.getString(R.string.cant_call_due_to_ongoing_call,
+                    activeCall.getTargetPhoneAccountLabel());
+        }
+        // Call is managed and there are ongoing self-managed calls.
+        markCallAsDisconnected(call, new DisconnectCause(DisconnectCause.ERROR,
+                errorMessage, errorMessage, "Ongoing call in another app."));
+        markCallAsRemoved(call);
+    }
+
+    /**
      * Cleans up any calls currently associated with the specified connection service when the
      * service binder disconnects unexpectedly.
      *
@@ -2137,16 +2213,40 @@ public class CallsManager extends Call.ListenerBase
 
     @VisibleForTesting
     public int getNumCallsWithState(final boolean isSelfManaged, Call excludeCall,
-                                     PhoneAccountHandle phoneAccountHandle, int... states) {
+                                    PhoneAccountHandle phoneAccountHandle, int... states) {
+        return getNumCallsWithState(isSelfManaged ? CALL_FILTER_SELF_MANAGED : CALL_FILTER_MANAGED,
+                excludeCall, phoneAccountHandle, states);
+    }
+
+    /**
+     * Determines the number of calls matching the specified criteria.
+     * @param callFilter indicates whether to include just managed calls
+     *                   ({@link #CALL_FILTER_MANAGED}), self-managed calls
+     *                   ({@link #CALL_FILTER_SELF_MANAGED}), or all calls
+     *                   ({@link #CALL_FILTER_ALL}).
+     * @param excludeCall Where {@code non-null}, this call is excluded from the count.
+     * @param phoneAccountHandle Where {@code non-null}, calls for this {@link PhoneAccountHandle}
+     *                           are excluded from the count.
+     * @param states The list of {@link CallState}s to include in the count.
+     * @return Count of calls matching criteria.
+     */
+    @VisibleForTesting
+    public int getNumCallsWithState(final int callFilter, Call excludeCall,
+                                    PhoneAccountHandle phoneAccountHandle, int... states) {
 
         Set<Integer> desiredStates = IntStream.of(states).boxed().collect(Collectors.toSet());
 
         Stream<Call> callsStream = mCalls.stream()
                 .filter(call -> desiredStates.contains(call.getState()) &&
-                        call.getParentCall() == null && !call.isExternalCall() &&
-                        call.isSelfManaged() == isSelfManaged);
+                        call.getParentCall() == null && !call.isExternalCall());
 
-        // If a call to exclude was specifeid, filter it out.
+        if (callFilter == CALL_FILTER_MANAGED) {
+            callsStream = callsStream.filter(call -> !call.isSelfManaged());
+        } else if (callFilter == CALL_FILTER_SELF_MANAGED) {
+            callsStream = callsStream.filter(call -> call.isSelfManaged());
+        }
+
+        // If a call to exclude was specified, filter it out.
         if (excludeCall != null) {
             callsStream = callsStream.filter(call -> call != excludeCall);
         }
@@ -2237,18 +2337,31 @@ public class CallsManager extends Call.ListenerBase
     }
 
     /**
+     * Determines if there are any ongoing managed or self-managed calls.
+     * Note: The {@link #ONGOING_CALL_STATES} are
+     * @return {@code true} if there are ongoing managed or self-managed calls, {@code false}
+     *      otherwise.
+     */
+    public boolean hasOngoingCalls() {
+        return getNumCallsWithState(
+                CALL_FILTER_ALL, null /* excludeCall */,
+                null /* phoneAccountHandle */,
+                ONGOING_CALL_STATES) > 0;
+    }
+
+    /**
      * Determines if there are any ongoing managed calls.
      * @return {@code true} if there are ongoing managed calls, {@code false} otherwise.
      */
     public boolean hasOngoingManagedCalls() {
         return getNumCallsWithState(
-                false /* isSelfManaged */, null /* excludeCall */,
+                CALL_FILTER_MANAGED, null /* excludeCall */,
                 null /* phoneAccountHandle */,
-                LIVE_CALL_STATES) > 0;
+                ONGOING_CALL_STATES) > 0;
     }
 
     /**
-     * Deteremines if the system incoming call UI should be shown.
+     * Determines if the system incoming call UI should be shown.
      * The system incoming call UI will be shown if the new incoming call is self-managed, and there
      * are ongoing calls for another PhoneAccount.
      * @param incomingCall The incoming call.
@@ -2604,6 +2717,97 @@ public class CallsManager extends Call.ListenerBase
     }
 
     /**
+     * Used to confirm creation of an outgoing call which was marked as pending confirmation in
+     * {@link #startOutgoingCall(Uri, PhoneAccountHandle, Bundle, UserHandle, Intent)}.
+     * Called via {@link TelecomBroadcastIntentProcessor} for a call which was confirmed via
+     * {@link ConfirmCallDialogActivity}.
+     * @param callId The call ID of the call to confirm.
+     */
+    public void confirmPendingCall(String callId) {
+        Log.i(this, "confirmPendingCall: callId=%s", callId);
+        if (mPendingCall != null && mPendingCall.getId().equals(callId)) {
+            Log.addEvent(mPendingCall, LogUtils.Events.USER_CONFIRMED);
+            addCall(mPendingCall);
+
+            // We are going to place the new outgoing call, so disconnect any ongoing self-managed
+            // calls which are ongoing at this time.
+            disconnectSelfManagedCalls();
+
+            // Kick of the new outgoing call intent from where it left off prior to confirming the
+            // call.
+            CallIntentProcessor.sendNewOutgoingCallIntent(mContext, mPendingCall, this,
+                    mPendingCall.getOriginalCallIntent());
+            mPendingCall = null;
+        }
+    }
+
+    /**
+     * Used to cancel an outgoing call which was marked as pending confirmation in
+     * {@link #startOutgoingCall(Uri, PhoneAccountHandle, Bundle, UserHandle, Intent)}.
+     * Called via {@link TelecomBroadcastIntentProcessor} for a call which was confirmed via
+     * {@link ConfirmCallDialogActivity}.
+     * @param callId The call ID of the call to cancel.
+     */
+    public void cancelPendingCall(String callId) {
+        Log.i(this, "cancelPendingCall: callId=%s", callId);
+        if (mPendingCall != null && mPendingCall.getId().equals(callId)) {
+            Log.addEvent(mPendingCall, LogUtils.Events.USER_CANCELLED);
+            markCallAsDisconnected(mPendingCall, new DisconnectCause(DisconnectCause.CANCELED));
+            markCallAsRemoved(mPendingCall);
+            mPendingCall = null;
+        }
+    }
+
+    /**
+     * Called from {@link #startOutgoingCall(Uri, PhoneAccountHandle, Bundle, UserHandle, Intent)} when
+     * a managed call is added while there are ongoing self-managed calls.  Starts
+     * {@link ConfirmCallDialogActivity} to prompt the user to see if they wish to place the
+     * outgoing call or not.
+     * @param call The call to confirm.
+     */
+    private void startCallConfirmation(Call call) {
+        if (mPendingCall != null) {
+            Log.i(this, "startCallConfirmation: call %s is already pending; disconnecting %s",
+                    mPendingCall.getId(), call.getId());
+            markCallDisconnectedDueToSelfManagedCall(call);
+            return;
+        }
+        Log.addEvent(call, LogUtils.Events.USER_CONFIRMATION);
+        mPendingCall = call;
+
+        // Figure out the name of the app in charge of the self-managed call(s).
+        Call selfManagedCall = mCalls.stream()
+                .filter(c -> c.isSelfManaged())
+                .findFirst()
+                .orElse(null);
+        CharSequence ongoingAppName = "";
+        if (selfManagedCall != null) {
+            ongoingAppName = selfManagedCall.getTargetPhoneAccountLabel();
+        }
+        Log.i(this, "startCallConfirmation: callId=%s, ongoingApp=%s", call.getId(),
+                ongoingAppName);
+
+        Intent confirmIntent = new Intent(mContext, ConfirmCallDialogActivity.class);
+        confirmIntent.putExtra(ConfirmCallDialogActivity.EXTRA_OUTGOING_CALL_ID, call.getId());
+        confirmIntent.putExtra(ConfirmCallDialogActivity.EXTRA_ONGOING_APP_NAME, ongoingAppName);
+        confirmIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        mContext.startActivityAsUser(confirmIntent, UserHandle.CURRENT);
+    }
+
+    /**
+     * Disconnects all self-managed calls.
+     */
+    private void disconnectSelfManagedCalls() {
+        // Disconnect all self-managed calls to make priority for emergency call.
+        // Use Call.disconnect() to command the ConnectionService to disconnect the calls.
+        // CallsManager.markCallAsDisconnected doesn't actually tell the ConnectionService to
+        // disconnect.
+        mCalls.stream()
+                .filter(c -> c.isSelfManaged())
+                .forEach(c -> c.disconnect());
+    }
+
+    /**
      * Dumps the state of the {@link CallsManager}.
      *
      * @param pw The {@code IndentingPrintWriter} to write the state to.
@@ -2617,6 +2821,11 @@ public class CallsManager extends Call.ListenerBase
                 pw.println(call);
             }
             pw.decreaseIndent();
+        }
+
+        if (mPendingCall != null) {
+            pw.print("mPendingCall:");
+            pw.println(mPendingCall.getId());
         }
 
         if (mCallAudioManager != null) {
@@ -2708,9 +2917,55 @@ public class CallsManager extends Call.ListenerBase
             service.createConnectionFailed(call);
         }
     }
+
     public void clearPendingMOEmergencyCall() {
         mPendingMOEmerCall = null;
         mDisconnectingCall = null;
     }
 
+    private void broadcastUnregisterIntent(PhoneAccountHandle accountHandle) {
+        Intent intent =
+                new Intent(TelecomManager.ACTION_PHONE_ACCOUNT_UNREGISTERED);
+        intent.addFlags(Intent.FLAG_RECEIVER_INCLUDE_BACKGROUND);
+        intent.putExtra(
+                TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, accountHandle);
+        Log.i(this, "Sending phone-account %s unregistered intent as user", accountHandle);
+        mContext.sendBroadcastAsUser(intent, UserHandle.ALL,
+                PERMISSION_PROCESS_PHONE_ACCOUNT_REGISTRATION);
+
+        String dialerPackage = mDefaultDialerCache.getDefaultDialerApplication(
+                getCurrentUserHandle().getIdentifier());
+        if (!TextUtils.isEmpty(dialerPackage)) {
+            Intent directedIntent = new Intent(TelecomManager.ACTION_PHONE_ACCOUNT_UNREGISTERED)
+                    .setPackage(dialerPackage);
+            directedIntent.putExtra(
+                    TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, accountHandle);
+            Log.i(this, "Sending phone-account unregistered intent to default dialer");
+            mContext.sendBroadcastAsUser(directedIntent, UserHandle.ALL, null);
+        }
+        return ;
+    }
+
+    private void broadcastRegisterIntent(PhoneAccountHandle accountHandle) {
+        Intent intent = new Intent(
+                TelecomManager.ACTION_PHONE_ACCOUNT_REGISTERED);
+        intent.addFlags(Intent.FLAG_RECEIVER_INCLUDE_BACKGROUND);
+        intent.putExtra(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE,
+                accountHandle);
+        Log.i(this, "Sending phone-account %s registered intent as user", accountHandle);
+        mContext.sendBroadcastAsUser(intent, UserHandle.ALL,
+                PERMISSION_PROCESS_PHONE_ACCOUNT_REGISTRATION);
+
+        String dialerPackage = mDefaultDialerCache.getDefaultDialerApplication(
+                getCurrentUserHandle().getIdentifier());
+        if (!TextUtils.isEmpty(dialerPackage)) {
+            Intent directedIntent = new Intent(TelecomManager.ACTION_PHONE_ACCOUNT_REGISTERED)
+                    .setPackage(dialerPackage);
+            directedIntent.putExtra(
+                    TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, accountHandle);
+            Log.i(this, "Sending phone-account registered intent to default dialer");
+            mContext.sendBroadcastAsUser(directedIntent, UserHandle.ALL, null);
+        }
+        return ;
+    }
 }
